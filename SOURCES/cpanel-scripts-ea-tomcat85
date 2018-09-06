@@ -1,0 +1,287 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+# cpanel - scripts/ea-tomcat85                       Copyright 2018 cPanel, Inc.
+#                                                           All rights Reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+use strict;
+use warnings;
+
+package scripts::ea_tomcat85;
+
+use Cpanel::Config::LoadUserDomains ();
+use Cpanel::AccessIds               ();
+use Cpanel::JSON                    ();
+
+use File::Path::Tiny ();    # Path::Tiny’s version is overly complicated
+use Path::Tiny;
+use Capture::Tiny 'capture';
+use XML::LibXML ();
+use Cwd         ();
+use App::CmdDispatch;
+
+my $cmds = {
+    add => {
+        code     => \&add,
+        clue     => 'add <user>',
+        abstract => 'add tomcat 8.5 support',
+        help     => "add tomcat 8.5 instance to the given user.",
+    },
+    rem => {
+        code     => \&rem,
+        clue     => 'rem <user>',
+        abstract => 'remove tomcat 8.5 support',
+        help     => "Remove tomcat 8.5 instance from the given user.\n\tSince this is destructive you must also verify you want to continue. Passing --verify=<user> will make it work. If you don’t pass it an explanatory message is given with instructions.",
+
+    },
+    list => {
+        code => sub {
+            _bail( $_[0], "“list” does not take any arguments" ) if @_ > 1;
+            my %cpusers = Cpanel::Config::LoadUserDomains::loaduserdomains( undef, 0, 1 );
+            for my $user ( sort keys %cpusers ) {
+                print "$user\n" if -d _get_homedir($user) . "/ea-tomcat85";
+            }
+        },
+        clue     => 'list',
+        abstract => 'list users with tomcat 8.5 instance',
+        help     => 'List users, one per line, that have a tomcat 8.5 instance.',
+    },
+};
+
+my $hint_blurb = "This tool supports the following commands (i.e. $0 {command} …):";
+my $opts       = {
+    'help:pre_hint'  => $hint_blurb,
+    'help:pre_help'  => "Various tomcat 8.5 related admin utilities\n\n$hint_blurb",
+    default_commands => "help",
+    alias            => { remove => "rem" },
+};
+
+run(@ARGV) if !caller;
+
+sub run {
+    my (@argv) = @_;
+    die "This script should only be called as root\n" if $> != 0;
+
+    local $ENV{TERM} = $ENV{TERM} || "xterm-256color";    # non-CLI modulino avoid needless: Cannot find termcap: TERM not set at …/Term/ReadLine.pm line 373.
+    App::CmdDispatch->new( $cmds, $opts )->run(@argv);
+}
+
+################
+#### commands ##
+################
+
+sub add {
+    my ( $app, $user, $homedir ) = _process_args(@_);
+
+    _bail( $app, "The user already has a tomcat 8.5 instance." ) if -d "$homedir/ea-tomcat85";
+
+    print "Adding $user’s tomcat 8.5 instance …\n";
+
+    my ( $http_port, $ajp_port, $redirect_port ) = _get_ports($user);
+
+    my $curdir = Cwd::cwd();
+    Cpanel::AccessIds::do_as_user(
+        $user,
+        sub {
+            local $ENV{HOME} = $homedir;
+
+            mkdir "$homedir/ea-tomcat85" or die "Could not create directory “$homedir/ea-tomcat85”: $!\n";
+            chdir "$homedir/ea-tomcat85" or die "Could not change into “$homedir/ea-tomcat85”: $!\n";
+
+            for my $dir (qw(conf bin logs run temp webapps/ROOT work/Catalina/localhost/ROOT)) {
+                File::Path::Tiny::mk($dir) or die "Could not create directory “$dir”: $!\n";
+            }
+
+            my %symlinks = (
+                '/opt/cpanel/ea-tomcat85/README.USER-SERVICE-MANAGEMENT' => 'README.USER-SERVICE-MANAGEMENT',
+                '/opt/cpanel/ea-tomcat85/README.FASTERSTARTUP'           => 'README.FASTERSTARTUP',
+                '/opt/cpanel/ea-tomcat85/README.SECURITY'                => 'README.SECURITY',
+                '/opt/cpanel/ea-tomcat85/README.APACHE-PROXY'            => 'README.APACHE-PROXY',
+                '/opt/cpanel/ea-tomcat85/README.USER-INSTANCE'           => 'README.USER-INSTANCE',
+            );
+            for my $target ( keys %symlinks ) {
+                symlink( $target, $symlinks{$target} ) or die "Could not symlink “$symlinks{$target}” to “$target”: $!\n";
+            }
+
+            my $data_start = tell DATA;
+            path("bin/setenv.sh")->spew(<DATA>);
+            seek( DATA, $data_start, 0 );
+
+            system("cp -r /opt/cpanel/ea-tomcat85/user-conf/* conf/");
+            system("chmod 640 conf/*");
+
+            my $dom = XML::LibXML->load_xml( location => "conf/server.xml" );
+            $dom->findnodes('//Server[@shutdown="SHUTDOWN"]')->shift()->setAttribute( port => -1 );
+            for my $conn ( $dom->findnodes("//Server/Service/Connector") ) {
+                if ( $conn->getAttribute('protocol') eq 'HTTP/1.1' ) {
+                    $conn->setAttribute( port         => $http_port );
+                    $conn->setAttribute( redirectPort => $redirect_port );
+                }
+                elsif ( $conn->getAttribute('protocol') eq 'AJP/1.3' ) {
+                    $conn->setAttribute( port         => $ajp_port );
+                    $conn->setAttribute( redirectPort => $redirect_port );
+                }
+            }
+            _write_dom( "conf/server.xml" => $dom );
+
+            _sysdie( "add service management" => ( qw(/usr/local/cpanel/scripts/cpuser_service_manager add ea-tomcat85), "--init-script=/opt/cpanel/ea-tomcat85/bin/user-init.sh" ) );
+
+            _ubic_tc("start");
+        }
+    );
+
+    chdir $curdir or warn "Could not chdir back to “$curdir”: $!\n";
+    print " … done!\n";
+
+    return;
+}
+
+sub rem {
+    my ( $app, $user, $homedir ) = _process_args(@_);
+
+    _bail( $app, "The user does not have a tomcat 8.5 instance." ) if !-d "$homedir/ea-tomcat85";
+
+    print "Removing $user’s tomcat 8.5 instance …\n";
+
+    if ( !grep m/^--verify=\Q$user\E$/, @_ ) {
+        die "This operation can not be undone, please pass the --verify=<USER> to indicate you’ve backed up anything in $homedir/ea-tomcat85/ that you want to keep!\n";
+    }
+
+    Cpanel::AccessIds::do_as_user(
+        $user,
+        sub {
+            local $ENV{HOME} = $homedir;
+            _ubic_tc("stop");
+            _sysdie( "remove service management" => qw(/usr/local/cpanel/scripts/cpuser_service_manager rem ea-tomcat85) );
+            File::Path::Tiny::rm("$homedir/ea-tomcat85") or die "Could not remove directory “$homedir/ea-tomcat85”: $!\n";
+        }
+    );
+
+    print " … done!\n";
+
+    return;
+}
+
+###############
+#### helpers ##
+###############
+
+sub _ubic_tc {
+    my ($cmd) = @_;
+
+    # would be cool if Cpanel::FindBin (or whatever) did this for us: CPANEL-22345
+    my $real_perl  = readlink("/usr/local/cpanel/3rdparty/bin/perl");
+    my $cp_bin_dir = $real_perl;
+    $cp_bin_dir =~ s{/perl$}{};
+    local $ENV{PATH} = "$cp_bin_dir:$ENV{PATH}";    # not only does this allow it to find our ubic-admin, it allows its env-shebang to pick up our perl
+
+    system( "ubic", $cmd, "ea-tomcat85" );
+
+    return $? ? 0 : 1;
+}
+
+sub _sysdie {
+    my ( $do_this, @cmd ) = @_;
+    my $cmd_str = join( " ", @cmd );
+    system(@cmd) && die "Failed to $do_this (exit $?)\nThis will need done manually:\n\t`$cmd_str`\n";
+    return;
+}
+
+sub _bail {
+    my ( $app, $msg ) = @_;
+
+    chomp($msg);
+
+    die "$msg\n" if $ENV{"scripts::ea_tomcat85::bail_die"};
+
+    warn "$msg\n";
+    $app->help();
+    exit(1);    # there is no return()ing from this lol
+}
+
+sub _process_args {
+    my ( $app, $user ) = @_;
+
+    _bail( $app, "User argument is missing." ) if !$user;
+    _bail( $app, "User argument is invalid." ) if !exists { Cpanel::Config::LoadUserDomains::loaduserdomains( undef, 0, 1 ) }->{$user};
+
+    return ( $app, $user, _get_homedir($user) );
+}
+
+sub _get_homedir {
+    my ($user) = @_;
+    return ( getpwnam($user) )[7];
+}
+
+sub _get_ports {
+    my ($user) = @_;
+    my ( $http_port, $ajp_port, $redirect_port );
+
+    _load_modulino("/usr/local/cpanel/scripts/cpuser_port_authority");
+
+    # see if they have them already so that we don’t keep allocating them
+    if ( -f $scripts::cpuser_port_authority::port_authority_conf ) {
+        my @ports;
+        my $hr = eval { Cpanel::JSON::LoadFile($scripts::cpuser_port_authority::port_authority_conf) } || {};
+        for my $port ( keys %{$hr} ) {
+            next if $hr->{$port}{owner} ne $user || !exists $hr->{$port}{service} || $hr->{$port}{service} ne 'ea-tomcat85';
+            push @ports, $port;
+        }
+        if ( @ports > 2 ) {
+            ( $http_port, $ajp_port, $redirect_port ) = sort @ports;
+        }
+    }
+
+    if ( !$http_port || !$ajp_port || !$redirect_port ) {
+        my @cmd = ( qw(/usr/local/cpanel/scripts/cpuser_port_authority give), $user, qw(3 --service=ea-tomcat85) );
+        my ( $stdout, $stderr, $exit ) = capture { system(@cmd) };    # we could scripts::cpuser_port_authority::run("give", … but its nice to output the command, and the exit value is nice to detect success/failure
+
+        if ($exit) {
+            my $cmd = join( " ", @cmd );
+            die "Failed to allocate ports!\n`$cmd` exited $exit\n";
+        }
+        else {
+            my @lines = split( /\n/, $stdout );
+            chomp(@lines);
+            ( $http_port, $ajp_port, $redirect_port ) = sort grep { m/^[1-9][0-9]+$/ } @lines;
+        }
+    }
+
+    if ( !$http_port || !$ajp_port || !$redirect_port ) {
+        die "Failed to get three ports!\n";
+    }
+
+    return ( $http_port, $ajp_port, $redirect_port );
+}
+
+sub _load_modulino {
+    my ($modulino) = @_;
+    eval { require "$modulino" };
+    die "This feature is not available on this version of cPanel. You need v76 or newer\n" if $@;
+    return 1;
+}
+
+sub _write_dom {
+    my ( $path, $dom ) = @_;
+
+    # get nicely indented XML (from http://grantm.github.io/perl-libxml-by-example/dom.html#modifying-the-dom)
+    for my $node ( $dom->findnodes('//text()') ) {
+        $node->parentNode->removeChild($node) unless $node =~ /\S/;
+    }
+
+    return path($path)->spew( $dom->toString(1) );
+}
+
+sub _get_cmd { $cmds }
+
+1;
+
+__DATA__
+# Your customizations can go here, for example, CATALINA_OPTS
+
+# example from https://wiki.apache.org/tomcat/HowTo/FasterStartUp#Entropy_Source
+# Trade some security for startup speed by using non-blocking entropy:
+# CATALINA_OPTS="$CATALINA_OPTS -Djava.security.egd=file:/dev/./urandom"
+
+# DO NOT EDIT THIS LINE OR ANYTHING BELOW THIS LINE
+. /opt/cpanel/ea-tomcat85/bin/user-setenv.sh
